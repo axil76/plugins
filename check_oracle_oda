@@ -1,0 +1,982 @@
+#!/usr/bin/perl
+#-w
+#
+# ============================== SUMMARY =====================================
+#
+# Program  : check_oracle_oda.pl
+# Version  : 0.1
+# Date     : Janvier 2 , 2017
+# Author   : Lebas Jerome - jerome.lebas@laposte.fr
+# Summary  : This is a nagios plugin monitor the ODA appliance.
+# Licence  : GPL - summary below, full text at http://www.fsf.org/licenses/gpl.txt
+
+# =============================== SETUP NOTES ================================
+#
+# List of files to check are specified with -m option. These should be
+# specified in a way you'd specify files for ls, so for example to check
+# all perl files you use "*.pl" which is specified as:
+#    $ ./check_oracle_oda.pl -m network
+
+
+use strict;
+use Switch;
+use Getopt::Long;
+use Data::Dumper;
+#use Path::Class;
+#use autodie;
+
+# Nagios specific
+use lib "/usr/lib/nagios/plugins";
+our $TIMEOUT;
+our %ERRORS;
+eval 'use utils qw(%ERRORS $TIMEOUT)';
+if ($@) {
+ $TIMEOUT = 20;
+ %ERRORS = ('OK'=>0,'WARNING'=>1,'CRITICAL'=>2,'UNKNOWN'=>3,'DEPENDENT'=>4);
+}
+
+my $Version='0.1';
+my $o_help=        		undef; # help option
+my $o_timeout=      	10;    # Default 10s Timeout
+my $o_verb=         	undef; # verbose mode
+my $o_version=      	undef; # version info option
+my $o_mode =        	undef; # mode monitoring
+my $o_warning_redo=    	undef; # warning option redo fs
+my $o_critical_redo=  	undef; # critical option redo fs
+my $o_warning_data=   	undef; # warning option data fs
+my $o_critical_data=   	undef; # critical option data fs
+my $o_warning_flash=   	undef; # warning option flash fs
+my $o_critical_flash=  	undef; # critical option flash fs
+my $o_warning_reco=    	undef; # warning option reco fs
+my $o_critical_reco=   	undef; # critical option reco fs
+my $o_critical_alag=   	200; # critical option apply lag duration
+my $o_warning_alag=   	100; # warning option apply lag duration
+my $o_degree_warn = 	undef; # degree power
+my $o_degree_crit = 	undef; # degree power
+my $o_perf=         	undef; # Performance data option
+my $o_debug=        	undef; # debug mode
+my $o_inst=        		undef; # instance
+my $o_path=         	undef; # path oracle bin
+
+my $d_degree_warn = 40;
+my $d_degree_crit = 50;
+
+my $OAKCLI_HOSTS = undef;
+my $OAKCLIMONITORING_PATH = "/opt/oracle/oak/bin/oakcli";
+my $OAKCLIMONITORING_ARGS = "show";
+my $ORACLE_RAC = "/u01/app/12.1.0.2/grid/";
+my $ORACLE_CRSCHK = $ORACLE_RAC."bin/crsctl";
+my $ORACLE_ASMCMD = $ORACLE_RAC."bin/asmcmd";
+
+my $OAKCLIMONITORING_OUTPUT;
+my @OAKCLIMONITORING_OUTPUT_LINES;
+my @OAKCLRESULT;
+my @ASMRESULT;
+my @INSTCHKRESULT;
+my $CRSCHKMONITORING_OUTPUT;
+my @CRSCHKMONITORING_OUTPUT_LINES;
+my @CRSCHKRESULT;
+my @INFOSTANDBY;
+
+#my ($cmd, $line, $output, $rc);
+my $num_output = 0;
+my $warning_num = 0;
+my $critical_num = 0;
+my $fatal_error = 0;
+my $debug;
+
+my @msg						= ();
+my @perfdata				= ();
+
+
+our @nagiosstate = ('OK', 'WARNING', 'CRITICAL', 'UNKNOWN');
+my %comp_state = { 'OK' =>[] , 'WARNING' =>[], 'CRITICAL' =>[] };
+
+sub executeCommand {
+	my $command = join ' ', @_;
+	($_ = qx{$command 2>&1}, $? >> 8);
+}
+
+sub command_oakcli{
+	my $m=shift;
+	#Command
+	my $cmd = "$OAKCLIMONITORING_PATH $OAKCLIMONITORING_ARGS $m";
+	if ( $debug ) { print $cmd."\n" ;}	 
+	#Execute command
+	my ($output, $rc) = executeCommand($cmd);
+	#Test exit code
+	printResultAndExit(2, "oakcli call failed with RC $rc.\n" . "OUTPUT : " . $output . "COMMAND: " . $cmd) unless ($rc == 0);
+	#Remove \n
+	@OAKCLIMONITORING_OUTPUT_LINES = split(/\n/, $output);
+	return @OAKCLIMONITORING_OUTPUT_LINES;
+}
+
+sub command_crsctl{
+	my $m=shift;
+	#Command
+	my $cmd = "$ORACLE_CRSCHK $m";
+	if ( $debug ) { print $cmd."\n" ;}	 
+	#Execute command
+	my ($output, $rc) = executeCommand($cmd);
+	#Test exit code
+	printResultAndExit(2, "crsctl  call failed with RC $rc.\n" . "OUTPUT : " . $output . "COMMAND: " . $cmd) unless ($rc == 0);
+	#Remove \n
+	@OAKCLIMONITORING_OUTPUT_LINES = split(/\n/, $output);
+	return @OAKCLIMONITORING_OUTPUT_LINES;
+}
+
+sub command_asm{
+	my $m=shift;
+	#Command
+	my $cmd = "$ORACLE_ASMCMD $m";
+	if ( $debug ) { print $cmd."\n" ;}	 
+	#Execute command
+	my ($output, $rc) = executeCommand($cmd);
+	#Test exit code
+	printResultAndExit(2, "lsdg  call failed with RC $rc.\n" . "OUTPUT : " . $output . "COMMAND: " . $cmd) unless ($rc == 0);
+	#Remove \n
+	@OAKCLIMONITORING_OUTPUT_LINES = split(/\n/, $output);
+	return @OAKCLIMONITORING_OUTPUT_LINES;
+}
+
+sub command_dgmgrl{
+	my $m=shift;
+	#Command
+	my $cmd = "$m";
+	if ( $debug ) { print $cmd."\n" ;}	 
+	#Execute command
+	my ($output, $rc) = executeCommand($cmd);
+	#Test exit code
+	#printResultAndExit(2, "dgmgrl  call failed with RC $rc.\n" . "OUTPUT : " . $output . "COMMAND: " . $cmd) unless ($rc == 0);
+	#Remove \n
+	@OAKCLIMONITORING_OUTPUT_LINES = split(/\n/, $output);
+	return @OAKCLIMONITORING_OUTPUT_LINES;
+}
+
+sub check_asm {
+	if ( (!$o_critical_data) || (!$o_warning_data) || (!$o_critical_flash) || (!$o_warning_flash) || (!$o_critical_redo) || (!$o_warning_redo) || (!$o_critical_reco) || (!$o_warning_reco) ){ help(); exit $ERRORS{"UNKNOWN"}; }
+    @ASMRESULT=command_asm("lsdg");   	
+	my $output_str;
+    foreach my $line (@ASMRESULT){
+		#State    Type    Rebal  Sector  Block       AU  Total_MB   Free_MB  Req_mir_free_MB  Usable_file_MB  Offline_disks  Voting_files  Name
+		#MOUNTED  HIGH    N         512   4096  4194304  51544064  40254680          6443008        11270557              0             Y  DATA/
+		#MOUNTED  NORMAL  N         512   4096  4194304   1526208    954324           381552          286386              0             N  FLASH/
+		#MOUNTED  HIGH    N         512   4096  4194304  68474432  53380696          8559304        14940464              0             N  RECO/
+		#MOUNTED  HIGH    N         512   4096  4194304    763120    539248           381560           52562              0             N  REDO/
+		my @output;         
+		next if $line =~ /State/;
+		if ($line =~ /MOUNTED\s*(\w+)\s*(\w+)\s*(\d+)\s*(\d+)\s*(\d+)\s*(\d+)\s*(\d+)\s*(\d+)\s*(\d+)\s*(\d+)\s*(\w+)\s*(\w+)[\/]\s*/){ 
+			if ($debug){ print "debug ligne: $1 $2 $3 $4 $5 $6 $7 $8 $9 $10 $11 $12 \n"};
+			my $FS=$12;
+			my $FREEMB=$7/1024.00;			
+			my $REQFREEMB=$8/1024.00;			
+			my $TOTALMB=$6/1024.00;
+			my $USAGEFILEMB=$9/1024.00;
+			my $PERCENT = 100.00 * $USAGEFILEMB/$TOTALMB;
+			if ($debug){ print "debug pourcent : $PERCENT \n"};
+			if ($debug){ print "debug fs : $FS \n"};
+			if ($FS =~ /DATA/){
+				if ($debug){ print "debug : $o_critical_data $o_warning_data $PERCENT \n"};
+				if($o_critical_data < $PERCENT){					
+						$fatal_error++;
+						$output_str = 'CRITICAL';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+				}elsif($o_warning_data < $PERCENT){
+						$warning_num++;
+						$output_str = 'WARNING';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");	
+				}else{
+						$output_str = 'OK';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");						
+				}
+			}elsif($FS =~ /FLASH/){
+				if ($debug){ print "debug : $o_critical_flash $o_warning_flash $PERCENT \n"};
+				if($o_critical_flash < $PERCENT){					
+						$fatal_error++;
+						$output_str = 'CRITICAL';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+				}elsif($o_warning_flash < $PERCENT){
+						$warning_num++;
+						$output_str = 'WARNING';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+				}else{
+						$output_str = 'OK';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+						
+				}			
+			}elsif($FS =~ /RECO/){
+				if ($debug){ print "debug : $o_critical_reco $o_warning_reco $PERCENT \n"};
+				if($o_critical_reco < $PERCENT){					
+						$fatal_error++;
+						$output_str = 'CRITICAL';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+				}elsif($o_warning_reco < $PERCENT){
+						$warning_num++;
+						$output_str = 'WARNING';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");						
+				}else{
+						$output_str = 'OK';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+						
+				}			
+			}elsif($FS =~ /REDO/){
+				if ($debug){ print "debug : $o_critical_redo $o_warning_redo $PERCENT \n"};
+				if($o_critical_redo < $PERCENT){					
+						$fatal_error++;
+						$output_str = 'CRITICAL';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+				}elsif($o_warning_redo < $PERCENT){
+						$warning_num++;
+						$output_str = 'WARNING';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");						
+				}else{
+						$output_str = 'OK';
+						push (@{$comp_state{$output_str}}, $FS);
+						push (@msg, "$FS=$output_str");
+				}			
+			}
+			#push (@perfdata, "Degree_$i=${degree}C;0;100");
+			push (@perfdata, "".$FS."=".$PERCENT."%;0;100");
+		}
+	}
+}
+
+
+sub check_crs {
+    @CRSCHKRESULT=command_crsctl("check crs");    
+    my $line;
+	foreach $line (@CRSCHKRESULT)
+	{
+        my $output_str;
+        #CRS-4638: Oracle High Availability Services is online
+        #CRS-4537: Cluster Ready Services is online
+        #CRS-4529: Cluster Synchronization Services is online
+        #CRS-4533: Event Manager is online
+        my @output; 
+        #my $regex = '(.*)(online)';        
+        if ($line =~ /(.*)(online)/){ 
+            $output_str = 'OK';                
+            @output = split(':', $1); 
+            $output[1] =~ s/is//g;           
+			push (@{$comp_state{$output_str}}, $output[1]." OK");
+			push (@msg, "$output[1] OK");			
+			next;
+        }elsif($line =~ /(.*)\sis\s(.*)/){	
+			if ($debug){ print "Not find term online : $line\n"};
+			$fatal_error++;
+            $output_str = 'CRITICAL';
+            @output = split(':', $1); 
+            $output[1] =~ s/is//g;
+            push (@{$comp_state{$output_str}}, $output[1]);
+            push (@msg, "$output[1]");
+			next;
+		}
+    }   
+}
+
+
+sub check_dgmgrl_broker { 
+    my @list_inst;
+    my $output_str;
+    my $standby_db;
+    if(!$o_inst){    
+        if ($debug){ print "debug oratab: \n"};       
+        open(my $oratab, "<", "/etc/oratab") or die printResultAndExit (3, join(' ', "File not found"));
+        while( defined( $_ = <$oratab> ) ) {
+           next if ($_ =~ /^#/);
+           next if ($_ =~ /^ /);
+           next if (($_ =~ /^-MGMTDB/) || ($_ =~ /^[+]APX/) || ($_ =~ /^[+]ASM/));
+           if ($_ =~ /(.*):(.*):(.*)/){
+                push @list_inst,$1;         
+           }
+        }
+        if ($debug){ Dumper(@list_inst)};
+        if (!@list_inst){
+            $output_str = 'UNKNOWN';
+            push (@{$comp_state{$output_str}}, "No Database present in /etc/oratab");
+            push (@msg, "No Database present in /etc/oratab");
+            printResultAndExit (3, join(' ', @msg));    
+            exit $ERRORS{"UNKNOWN"};
+        }
+    }else{
+       if ($debug){ print "debug instance: $o_inst \n"}; 
+       push @list_inst,$o_inst;
+       if ($debug){ Dumper(@list_inst)}; 
+    }
+    #DGMGRL> show database 'STDDBT01';
+    #
+    #Database - STDDBT01
+    #
+    #  Role:            PHYSICAL STANDBY
+    #  Intended State:  APPLY-ON
+    #  Transport Lag:   0 seconds (computed 0 seconds ago)
+    #  Apply Lag:       0 seconds (computed 0 seconds ago)
+    #  Apply Rate:      1.44 MByte/s
+    #  Real Time Query: OFF
+    #  Instance(s):
+    #    STDDBT01
+    #
+    #Database Status:
+    #SUCCESS
+    
+    #Database - STDP1LTM
+    #
+    #Role:            PHYSICAL STANDBY
+    #Intended State:  APPLY-ON
+    #Transport Lag:   1 day(s) 1 hour(s) 39 minutes 56 seconds (computed 17 seconds ago)
+    #Apply Lag:       1 day(s) 1 hour(s) 41 minutes 8 seconds (computed 17 seconds ago)
+    #Apply Rate:      9.93 MByte/s
+    #Real Time Query: OFF
+    #Instance(s):
+    #STDP1LTM
+
+    
+    foreach my $instance (@list_inst){
+         #su - oracle -c '. oraenv <<< ORAD1002;set;dgmgrl / "show configuration"'
+         @INSTCHKRESULT=command_dgmgrl("su - oracle -c '. oraenv <<< $instance;dgmgrl / \"show configuration\"'");
+         #push (@msg, $instance);
+         foreach my $line (@INSTCHKRESULT){
+            #ORA-16525: the Data Guard broker is not yet available
+            if ($line =~ /(ORA\-)(.*):+\s(.*)/){
+                $critical_num++;
+                $output_str = 'CRITICAL';                
+                push (@{$comp_state{$output_str}}, $instance.":".$3 );
+                push (@msg, $instance." : ".$3);
+            }elsif($line =~ /Fast-Start Failover/){
+                next;
+            }elsif($line =~ /SUCCESS/){
+                $output_str = 'OK';
+                push (@{$comp_state{$output_str}}, $instance.": ENABLED"  );
+                push (@msg, $instance." : ENABLED");
+            }elsif($line =~ /DISABLED/){
+                $fatal_error++;
+                $output_str = 'CRITICAL';
+                push (@{$comp_state{$output_str}}, $instance.": DISABLED");
+                push (@msg, $instance." : DISABLED");
+            }elsif($line =~ /Error/){
+                $critical_num++;
+                $output_str = 'CRITICAL';
+                push (@{$comp_state{$output_str}}, "ERROR ");
+                push (@msg,"ERROR ");    
+            }elsif($line =~ /(.*)-\s(Physical standby database)/){
+                my $instancestb = $1;
+                $instancestb =~ s/\s//g;
+                #@INFOSTANDBY=command_dgmgrl("su - oracle -c '. oraenv <<< $instance;dgmgrl / \"show database \'$instance\';\"'");
+                @INFOSTANDBY=command_dgmgrl("su - oracle -c \". oraenv <<< $instance;dgmgrl / 'show database  \\\"$instancestb\\\";'\"");                  
+                foreach my $db (@INFOSTANDBY){
+                   if ($debug){ $db }; 
+                   if ($db =~ /(Transport Lag):.*(\d)\s(.*).*[(].*[)]/){                   
+                        push (@perfdata, "".$instance."_TL=$2$3");
+                   }elsif($db =~ /(Apply Lag):.*(\d)\s(day[(]s[)]).*[(].*[)]/){                            
+                        my $count = $2*86400;
+                        push (@perfdata, "".$instance."_AL=".$count."seconds");
+                        $fatal_error++;
+                        $output_str = 'CRITICAL';
+                        push (@{$comp_state{$output_str}}, $2);
+                        push (@msg, "Transport Lag=$2 day(s)");
+                   }elsif($db =~ /(Apply Lag):.*(\d)\s(hour[(]s[)]).*[(].*[)]/){                            
+                        my $count = $2*3600;    
+                        push (@perfdata, "".$instance."_AL=".$count."seconds");   
+                        $fatal_error++;
+                        $output_str = 'CRITICAL';
+                        push (@{$comp_state{$output_str}}, $2);
+                        push (@msg, "Transport Lag=$2 hour(s)");         
+                   }elsif($db =~ /(Apply Lag):.*(\d)\s(seconds).*[(].*[)]/){
+                        push (@perfdata, "".$instance."_AL=$2$3");
+                        if (($o_critical_alag)&($o_warning_alag)){
+                           if($o_critical_alag < $2){					
+                                $fatal_error++;
+                                $output_str = 'CRITICAL';
+                                push (@{$comp_state{$output_str}}, $2);
+                                push (@msg, "Transport Lag=$2");
+                            }elsif($o_warning_alag < $2){
+                                $warning_num++;
+                                $output_str = 'WARNING';
+                                push (@{$comp_state{$output_str}}, $2);
+                                push (@msg, "Transport Lag=$2");
+                            }else{
+                                $output_str = 'OK';
+                                push (@{$comp_state{$output_str}}, $2);
+                                push (@msg, "Transport Lag=$2");                                
+                            }
+                        }
+                   }elsif($db =~ /(Apply Rate):.*\s.*(\d+(?:[.][0-9][0-9]))\s(\w)/){
+                        push (@perfdata, "".$instance."_AR=$2$3");
+                   }
+                }
+            }
+            if ($debug){ print "Critical : $fatal_error++\n"};
+            if ($debug){ print "debug dgmgrl : $line\n"};
+         }
+    } 
+     
+}
+
+
+sub check_crs_server {
+    @CRSCHKRESULT=command_crsctl("status server");    
+    my $line;
+	foreach $line (@CRSCHKRESULT)
+	{
+        my $output_str;
+        my $info;
+        my $result;
+        #NAME=hrsys0c
+        #STATE=ONLINE
+        #NAME=hrsys1c
+        #STATE=ONLINE
+        my @output;        
+        if ($line =~ /(.*)=(.*)/){
+            if ($debug){ print "debug : $line $1 $2\n"};
+            $info = $1;
+            $result = $2;
+            if ( $info =~ /NAME/){        
+                push (@{$comp_state{$output_str}}, $result );
+                push (@msg, $result);
+                if ($debug){ print "debug name: $result\n"};   
+            }elsif( $info =~ /STATE/){  	
+                if ($debug){ print "debug state: $result\n"};
+                if ($result =~ /ONLINE/){
+                    $output_str = 'OK';
+                    push (@{$comp_state{$output_str}}, $result);
+                    push (@msg, $result);    
+                }else{
+                    $fatal_error++;
+                    $output_str = 'CRITICAL';
+                    push (@{$comp_state{$output_str}}, $result);
+                    push (@msg, "$result");
+                }                
+            } 
+        }else{
+            if ($debug){ print "debug : $line\n"};
+            next;
+        }
+    }   
+}
+
+
+sub check_res {    
+    my @list = split(/,/, $o_inst);  
+    for my $list (@list){
+        if ($debug){ print "debug option res : $list\n"};
+        @CRSCHKRESULT=command_crsctl("status res $list");    
+        my $line;
+        foreach $line (@CRSCHKRESULT)
+        {
+            my $output_str;
+            my $info;
+            my $result;
+            #NAME=hrsys0c
+            #STATE=ONLINE
+            #NAME=hrsys1c
+            #STATE=ONLINE
+            my @output;
+            if ($line =~ /Could not find resource/){    
+                $output_str = 'UNKNOWN';
+                push (@{$comp_state{$output_str}}, $line );
+                push (@msg, $line);
+                printResultAndExit (3, join(' - ', @msg));    
+                exit $ERRORS{"UNKNOWN"};
+            }elsif($line =~ /(.*)=(.*)/){
+                if ($debug){ print "debug : $line $1 $2\n"};
+                $info = $1;
+                $result = $2;
+                if ( $info =~ /NAME/){        
+                    push (@{$comp_state{$output_str}}, $result );
+                    push (@msg, $result);
+                    if ($debug){ print "debug name: $result\n"};   
+                }elsif( $info =~ /STATE/){  	
+                    if ($debug){ print "debug state: $result\n"};
+                    if ($result =~ /ONLINE/){
+                        $output_str = 'OK';
+                        push (@{$comp_state{$output_str}}, $result);
+                        push (@msg, $result);    
+                    }else{
+                        $fatal_error++;
+                        $output_str = 'CRITICAL';
+                        push (@{$comp_state{$output_str}}, $result);
+                        push (@msg, "$result");
+                    }                
+                } 
+            }else{
+                if ($debug){ print "debug : $line\n"};
+                next;
+            }
+        }
+    }        
+}
+
+
+sub check_memory { 
+	@OAKCLRESULT=command_oakcli("memory");	
+	my $line;
+	foreach $line (@OAKCLRESULT)
+	{
+		my ($dimm,$state);
+		my $output_str;
+		#format:
+		#DIMM_0  OK     -              6A4G40DM0-CPB    00CE021631330DC584 P0/D0    Samsung      32 GB       2133 MHz       0
+		# skip header line
+		next if $line =~ "NAME";
+		next if $line =~ /^$/;
+		next if $line =~ /^\s*#/;		
+		my $regex = '([A-Z-a-z-0-9].{6})\s*(.{2})';
+#		#my $regex = qr/^(.{14})\s(.{2}).+(-)\s*(.{4})\s*(.+?)\s*(\w+)\s*(\w+)\s*([0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f])\s*(\w+)\s*(.+?)\s*(-?[0-9]+(\.[0-9]+)?) /p;
+		if ($line =~ /$regex/){
+			$dimm = $1;
+			$state = $2;
+			if ($debug){
+				print ("Parsed: ",
+					$dimm, "\t",
+					$state, "\n"
+				);
+			}
+			if ($state eq 'OK'){
+				$output_str = 'OK';
+				push (@{$comp_state{$output_str}}, $dimm);
+				push (@msg, "$dimm=\"$state\"");
+				next;
+			}else{
+				$critical_num++;
+				$output_str = 'CRITICAL';
+				push (@msg, "$dimm=\"$state\"");
+				push (@{$comp_state{$output_str}}, $dimm);
+			}		
+		}else{	
+			if ($debug){ print "Not parsable: $line\n"};
+			#$fatal_error++;
+			next;
+		}
+	}	
+}
+
+sub check_power { 
+	@OAKCLRESULT=command_oakcli("power");	
+	my $line;
+	foreach $line (@OAKCLRESULT){
+		my ($powersupply,$state,$watts,$degree);
+		my $output_str;
+		# skip header line
+		next if $line =~ "NAME";
+		next if $line =~ /^$/;
+		next if $line =~ /^\s*#/;
+		# format:  
+		# Power_Supply_0  OK     -              7079395  476856Z+1625CE022G PS0      Present     175 watts    31.250 degree C 36.062 degree C
+		my $regex = '([A-Z-a-z-0-9].{14})\s*(.{2})\s*(.+?)\s*(\d+).*?([0-9]{6})+(.+?)([A-Z]{2})((\d+)|(\w+))\s*(\w+)\s*(\w+)\s*(\d+)\s*(\w+)\s*([0-9]+\.[0-9]*)|([0-9]*\.[0-9]+)|([0-9]+)';
+		#my $regex = '(.{14})\s*(.{2})';
+		#test regex		
+		#my $regex = qr/^(.{14})\s(.{2}).+(-)\s*(.{4})\s*(.+?)\s*(\w+)\s*(\w+)\s*([0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f])\s*(\w+)\s*(.+?)\s*(-?[0-9]+(\.[0-9]+)?) /p;
+		my $i=0;
+		if ($line =~ /$regex/){
+			$powersupply = $1;
+			$state = $2;
+			$watts = $13;
+			$degree = $15;
+			if ($debug){
+				print ("Parsed: ",
+					$powersupply, "\t",
+					$state, "\t",
+					$degree, "\t",
+					$watts, "\n",
+				);
+			}
+			if ($state eq 'OK'){
+				$output_str = 'OK';
+				push (@{$comp_state{$output_str}}, $powersupply);
+				push (@msg, "$powersupply=\"$state\"");
+				push (@perfdata, "$powersupply=${watts}W;0;1000");
+				push (@perfdata, "Degree_$i=${degree}C;0;100");
+				next;
+			}else{
+				$critical_num++;
+				$output_str = 'CRITICAL';
+				push (@msg, "$powersupply=\"$state\"");
+				push (@{$comp_state{$output_str}}, $powersupply);
+			}			
+		}else{	
+			if ($debug){ print "Not parsable: $line\n"};
+			#$fatal_error++;
+			next;
+		}
+		$i++;		
+	}
+	if ($debug){ print Dumper(@msg, @perfdata)};	
+}
+
+sub check_processor {
+	@OAKCLRESULT=command_oakcli("processor");	
+	my $line;
+	foreach $line (@OAKCLRESULT)
+	{
+		my ($processor,$state);
+		my $output_str;
+		# skip header line
+		next if $line =~ "NAME";
+		next if $line =~ /^$/;
+		next if $line =~ /^\s*#/;
+		#print $line ;
+		#my $regex = qr/OK/p;
+		#format:
+		# CPU_0 OK     -              060F     P0 (CPU 0) Intel(R) Xeon(R) CPU E5-2699  2.300 GHz       18          18
+		my $regex = '(.{5})\s(.{2})';
+		#my $regex = qr/^(.{14})\s(.{2}).+(-)\s*(.{4})\s*(.+?)\s*(\w+)\s*(\w+)\s*([0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f])\s*(\w+)\s*(.+?)\s*(-?[0-9]+(\.[0-9]+)?) /p;
+		my $i=0;
+		if ($line =~ /$regex/){
+			$processor = $1;
+			$state = $2;			
+			if ($state eq 'OK'){
+				if ($debug){print ("Parsed: ", $processor, "\t", $state, "\t");	}
+				$output_str = 'OK';
+				push (@{$comp_state{$output_str}}, $processor);
+				push (@msg, "$processor=\"$state\"");				
+				next;
+			}else{
+				$critical_num++;
+				$output_str = 'CRITICAL';
+				push (@msg, "$processor=\"$state\"");
+				push (@{$comp_state{$output_str}},$processor);
+			}			
+			
+		}else{	
+			if ($debug){ print "Not parsable: $line\n"};
+			#$fatal_error++;
+			next;
+		}
+		$i++;
+		if ($debug){ print Dumper(@msg, @perfdata)};
+	}
+}
+
+
+sub check_disk { 
+	@OAKCLRESULT=command_oakcli("disk");	
+	my $line;
+	foreach $line (@OAKCLRESULT)
+	{
+		my ($disk,$path,$type,$state,$state_details);
+		my $output_str;
+		# skip header line
+		next if $line =~ "NAME";
+		next if $line =~ /^$/;
+		next if $line =~ /^\s*#/;
+		#print $line ;
+		#my $regex = qr/OK/p;
+		#format:
+		#STATE		STATE_DETAILS	
+		#ONLINE		GOOD			Etat normal
+		#FAILED		DiskRemoved		Alerte
+		#OFFLINE	BAD				Alerte
+		#PARTIAL	PredictiveFail	Alerte
+		
+		#e0_pd_00        /dev/sda        HDD             ONLINE          Good		
+		my $regex = '(.{8})\s*(.{9})\s*(.{3})\s*(\w+)\s*(\w+)';
+		my $i=0;
+		if ($line =~ /$regex/){
+			$disk = $1;
+			$disk =~ s/\s//g;
+			$path = $2;
+			$type = $3;
+			$state = $4;
+			$state_details = $5;
+			if ($debug){print ("Parsed : ", $disk, "\t", $state, "\t",$state_details,"\n");	}	
+			if (($state eq 'ONLINE')&($state_details eq 'Good'))  {
+				if ($debug){print ("Parsed: ", $disk, "\t", $state, "\t",$state_details,"\n");	}
+				$output_str = 'OK';
+				push (@{$comp_state{$output_str}}, $disk);
+				push (@msg, "$disk=\"$state $state_details\"");	
+				push (@perfdata, "$disk=$state_details");	
+				next;
+			}else{
+				$critical_num++;
+				$output_str = 'CRITICAL';
+				push (@msg, "$disk=\"$state $state_details\"");
+				push (@{$comp_state{$output_str}}, $disk);
+			}			
+			
+		}else{	
+			if ($debug){ print "Not parsable : $line\n"};
+			#$fatal_error++;
+			next;
+		}
+		$i++;		
+	}
+	if ($debug){ print Dumper(@msg, @perfdata)};
+}
+
+sub check_cooling { 
+	@OAKCLRESULT=command_oakcli("cooling");	
+	my $line;
+	foreach $line (@OAKCLRESULT)
+	{
+		my ($cooling,$number,$path,$fan,$state,$state_details,$speed);
+		my $output_str;
+		# skip header line
+		next if $line =~ "NAME";
+		next if $line =~ /^$/;
+		next if $line =~ /^\s*#/;
+		#print $line ;
+		#my $regex = qr/OK/p;
+		#format:
+		#STATE		STATE_DETAILS	
+		#ONLINE		GOOD			Etat normal
+		#FAILED		DiskRemoved		Alerte
+		#OFFLINE	BAD				Alerte
+		#PARTIAL	PredictiveFail	Alerte
+		
+		#NAME   HEALTH HEALTH_DETAILS LOCATION FAN % FAN SPEED
+        #Fan_0  OK     -              FM0      26 %  5000 RPM
+		my $regex = '(\w+)[_](\d+)\s*(.{2})\s*(.{3})\s*(\w+)\s*(\w+)';
+		my $i=0;
+		if ($line =~ /$regex/){
+			$cooling = $1;
+			$cooling =~ s/\s//g;
+			$number = $2;
+			$number =~ s/\s//g;
+			$fan = $6;
+			$speed = $7;
+			$state = $3;
+			$state_details = $5;
+			if ($debug){print ("Parsed : ", $cooling, "\t", $state, "\t",$fan, "\t",$state_details,"\n");	}	
+			if ($state eq 'OK')  {
+				if ($debug){print ("Parsed: ", $cooling, "\t", $state, "\t",$state_details,"\n");	}
+				$output_str = 'OK';
+				push (@{$comp_state{$output_str}}, $cooling);
+				push (@msg, "$cooling-$number=\"$state $state_details\"");	
+				push (@perfdata, "$cooling-$number=$fan%;0;100");	
+				next;
+			}else{
+				$critical_num++;
+				$output_str = 'CRITICAL';
+				push (@msg, "$cooling-$number=\"$state $state_details\"");
+				push (@{$comp_state{$output_str}}, $cooling);
+			}			
+			
+		}else{	
+			if ($debug){ print "Not parsable : $line\n"};
+			#$fatal_error++;
+			next;
+		}
+		$i++;		
+	}
+	if ($debug){ print Dumper(@msg, @perfdata)};
+}
+
+
+sub check_network { 	
+	@OAKCLRESULT=command_oakcli("network");	
+	my $line;
+	foreach $line (@OAKCLRESULT)
+	{
+		my ($interface,$state,$name_interface,$degree);
+		my $output_str;
+		# skip header line
+		next if $line =~ "NAME";
+		next if $line =~ /^$/;
+		next if $line =~ /^\s*#/;
+		#print $line ;
+		#my $regex = qr/OK/p;
+		#format:
+		# Ethernet_NIC_0 OK     -              NET0     X540    INTEL        00:10:e0:bc:cb:bc  yes (eth0)    59.250 degree C
+		#my $regex = '([A-Z-a-z-0-9].{14})\s(.{2})';
+		my $regex = '(.{14})\s(.{2}).+(-)\s*(.{4})\s*(.+?)\s*(\w+)\s*(\w+)\s*([0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f][:-][0-9a-f][0-9a-f])\s*(\w+)\s*(.+?)\s*(-?[0-9]+(\.[0-9]+)?) ';
+		my $i=0;
+		if ($line =~ /$regex/){
+			$interface = $1;
+			$state = $2;
+			$name_interface = $10;
+			$degree = $11;
+			if ($debug){
+				print ("Parsed: ",
+					$interface, "\t",
+					$state, "\t",
+					$name_interface, "\t",
+					$degree, "\n"
+				);
+			}
+			if ($state eq 'OK'){
+				if ($debug){print ("Parsed: ", $interface, "\t", $state, "\t",$name_interface, "\t",$degree, "\n");	}
+				$output_str = 'OK';
+				push (@{$comp_state{$output_str}}, $interface);
+				push (@msg, "$interface=\"$state\"");
+				push (@perfdata, "Degree_$name_interface=${degree}C;0;100");
+				next;
+			}else{
+				$critical_num++;
+				$output_str = 'CRITICAL';
+				push (@msg, "$interface=\"$state\"");
+				push (@{$comp_state{$output_str}}, $interface);
+			}			
+			
+		}else{	
+			if ($debug){ print "Not parsable: $line\n"};
+			#$fatal_error++;
+			next;
+		}
+		$i++;
+		if ($debug){ print Dumper(@msg, @perfdata)};
+	}
+}
+
+sub printResultAndExit {
+
+#	# stop timeout
+#	alarm(0);
+	# print check result and exit
+	my $exitVal = shift;
+	print "$nagiosstate[$exitVal] : ";
+	print " @_" if (defined @_);
+	print "\n";
+	exit($exitVal);
+}
+
+sub help
+{
+    my $prog = $0;
+    print "Usage: $prog -m <mode>\n";
+    print_usage();
+    exit 0;
+}
+
+sub verb { my $t=shift; print $t,"\n" if defined($o_verb) ; }
+
+sub print_version { print "$Version" };
+
+#sub print_usage {
+#    print "Usage: $0 [-v] [-t <timeout>] -m <mode> \n";
+#}
+
+sub print_usage {
+    print "+--------------------------------------------------------------------------------------------------------------------+\n";
+    print "! check_oracle_oda - Check Oracle Database Appliance                                  								!\n";
+    print "! Version: ".print_version()."                                                        								!\n";
+    print "! Autor: Jerome LEBAS (jerome.lebas\@laposte.fr)                                      								!\n";
+    print "!                                                                                     								!\n";
+    print "! check_oracle_oda -m Type of Check (CONSTANT: CRS, CRSAPPS,ASMDISKSPACE,DATABASE,    								!\n";
+    print "!                                           DBINSTANCE)                               								!\n";
+    print "!               -i list available in command crsctl status res                        								!\n";    
+    print "!               -m type of check                                                      								!\n";
+    print "!               -p Oracle Home                                                        								!\n";
+    print "!               -d debug mode                                                         								!\n";
+    print "!               -v version                                                            								!\n";
+    print "!               -h help                                                               								!\n";
+    print "!                                                                                     								!\n";
+    print "! CRS      - Check Cluster Health                                                     								!\n";
+    print "! check_oracle_oda -m crsctl-crs                                                      								!\n";
+    print "!                                                                                     								!\n";
+    print "! CRSAPPS  - Check Application Status                                                 								!\n";
+    print "! check_oracle_oda -m crsctl-server                                                   								!\n";
+    print "!                                                                                     								!\n";
+    print "! HARDWARE - Check status hardware                                                    								!\n";
+    print "! check_oracle_oda -m network|memory|power|processor|disk|cooling  					 								!\n";
+    print "!                                                                                     								!\n";
+    print "! DATABASE|LISTENER - Check status listener or instance asm                           								!\n";
+    print "! check_oracle_oda -m crsctl-res                                                      								!\n";
+    print "! check_oracle_oda -m crsctl-res -i ora.LISTENER_SCAN1.lsnr,ora.LISTENER_SCAN2.lsnr   								!\n";
+    print "! check_oracle_oda -m crsctl-res -i ora.asm                                           								!\n";
+    print "!                                                                                     								!\n";    
+    print "! DATAGUARD - Check status replication dataguard for all instance                     								!\n";
+    print "! check_oracle_oda -m dgmgrl-broker                                                                                  !\n";
+    print "!                                                                                     								!\n";
+    print "! DATAGUARD - Check status replication dataguard for one instance in second                     								!\n";
+    print "! check_oracle_oda -m dgmgrl-broker -i instance --walag 100 --calag 200                                              !\n";
+    print "!                                                                                     								!\n";
+	print "! ASM - Check Free Space Redundancy (Type = HIGH) -w (%) -c (%)				     	 								!\n";
+    print "! check_oracle_oda -m asm --wdata 80 --cdata 90	--wflash 80 --cflash 90 --wredo 80 --credo 90 --wreco 80 --creco 90 !\n";	
+    print "+--------------------------------------------------------------------------------------------------------------------+\n";
+}
+
+sub check_options {
+    my $i;
+    Getopt::Long::Configure ("bundling");
+    GetOptions(        
+        'h'     => \$o_help,        		'help'          	=> \$o_help,
+		'v'     => \$o_version,     		'version'       	=> \$o_version,
+        't:i'   => \$o_timeout,     		'timeout:i'     	=> \$o_timeout,
+        'm:s'   => \$o_mode,     			'mode:s'       		=> \$o_mode,
+        'i:s'   => \$o_inst,     			'inst:s'       		=> \$o_inst,
+        'p:s'   => \$o_path,     			'path:s'       		=> \$o_path,
+		'cdata:i'	=> \$o_critical_data,	'critical-data:i'	=> \$o_critical_data,
+		'wdata:i'	=> \$o_warning_data,	'warning-data:i'	=> \$o_warning_data,
+		'cflash:i'	=> \$o_critical_flash,	'critical-flash:i'	=> \$o_critical_flash,
+		'wflash:i'	=> \$o_warning_flash,	'warning-flash:i'	=> \$o_warning_flash,		
+		'creco:i'	=> \$o_critical_reco,	'critical-reco:i'	=> \$o_critical_reco,
+		'wreco:i'	=> \$o_warning_reco,	'warning-reco:i'	=> \$o_warning_reco,
+		'credo:i'	=> \$o_critical_redo,	'critical-redo:i'	=> \$o_critical_redo,
+		'wredo:i'	=> \$o_warning_redo,	'warning-redo:i'	=> \$o_warning_redo,
+        'calag:i'	=> \$o_critical_alag,	'critical-alag:i'	=> \$o_critical_alag,
+        'walag:i'	=> \$o_warning_alag,	'warning-alag:i'	=> \$o_warning_alag,
+		'd'     => \$o_debug,     			'debug'       	=> \$o_debug,        
+    );
+    if (defined($o_help) ) { help(); exit $ERRORS{"UNKNOWN"}; }
+    if (defined($o_version)) { print_version(); exit $ERRORS{"UNKNOWN"}; }    
+	if (defined($o_debug) ) { $debug = 1; }
+    if (defined($o_path) ) { $ORACLE_RAC = $o_path;}    
+}
+
+#Main 
+ 
+check_options();
+
+if (!(-x $OAKCLIMONITORING_PATH)){
+    print "$OAKCLIMONITORING_PATH cannot be executed\n";
+    exit(1);
+}
+if ( $debug ) { print  "Mode :".$o_mode."\n" ;}
+	
+switch($o_mode){
+   case "network"       { check_network }
+   case "memory"        { check_memory }
+   case "power"         { check_power }
+   case "processor"     { check_processor }
+   case "disk"  	    { check_disk }
+   case "cooling"  	    { check_cooling }
+   case "crsctl-crs"    { check_crs }
+   case "crsctl-server" { check_crs_server }
+   case "crsctl-res"    { check_res($o_inst) }
+   case "dgmgrl-broker" { check_dgmgrl_broker }
+   case "asm" 			{ check_asm }    
+   else                 { push (@msg, "No mode find \n");  help(); printResultAndExit (3, join(' ', @msg)); }
+}
+
+
+# Get the alarm signal (just in case timeout screws up)
+#$SIG{'ALRM'} = sub {
+#    print ("ERROR: Alarm signal (Nagios time-out)\n");
+#    kill 9, $ls_pid if defined($ls_pid);
+#    exit $ERRORS{"UNKNOWN"};
+#};
+
+# Nagios Exit Codes
+# 0 = OK
+# 1 = WARNING
+# 2 = CRITICAL
+# 3 = UNKNOWN
+
+if ($fatal_error){
+    if ( $debug ) { print  "Fatal\n" ;}
+	printResultAndExit (3, join(' ', @msg) . "|" . join(' ', @perfdata));
+}
+
+if ($critical_num){
+    if ( $debug ) { print  "Critical\n" ;}
+	printResultAndExit (2, join(' ', @msg) . "|" . join(' ', @perfdata));
+}
+
+if ($warning_num){
+    if ( $debug ) { print  "Warning\n" ;}
+	printResultAndExit (1, join(' ', @msg) . "|" . join(' ', @perfdata));
+}
+if ( $debug ) { print "OK\n"};
+if (@perfdata){ printResultAndExit (0, join(' ', @msg) . "|" . join(' ', @perfdata));}else{printResultAndExit (0, join(' ', @msg));}
+
